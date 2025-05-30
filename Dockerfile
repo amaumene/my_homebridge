@@ -6,7 +6,7 @@ WORKDIR /build
 
 RUN npm set prefix=/build
 
-RUN npm install -g homebridge homebridge-dyson-pure-cool homebridge-config-ui-x @switchbot/homebridge-switchbot
+RUN npm install -g --omit dev homebridge homebridge-dyson-pure-cool homebridge-config-ui-x @switchbot/homebridge-switchbot
 
 FROM alpine
 
