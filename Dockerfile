@@ -1,6 +1,6 @@
 FROM alpine AS builder
 
-RUN apk add --no-cache nodejs npm python3
+RUN apk add --no-cache nodejs npm python3 make g++
 
 WORKDIR /build
 
