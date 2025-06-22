@@ -8,9 +8,9 @@ RUN npm set prefix=/build
 
 RUN npm install -g --omit dev homebridge homebridge-dyson-pure-cool homebridge-config-ui-x @switchbot/homebridge-switchbot
 
-RUN find . -name "*.node" -exec rm -f {} \;
+#RUN find . -name "*.node" -exec rm -f {} \;
 
-RUN npm rebuild --build-from-source
+#RUN npm rebuild --build-from-source
 
 FROM alpine
 
