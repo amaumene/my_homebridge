@@ -6,11 +6,7 @@ WORKDIR /build
 
 RUN npm set prefix=/build
 
-RUN npm install -g --omit dev homebridge homebridge-dyson-pure-cool
-
-RUN find . -name "*.node" -exec rm -f {} \;
-
-RUN npm rebuild --build-from-source
+RUN npm install --omit dev --build-from-source homebridge homebridge-dyson-pure-cool
 
 FROM alpine
 
@@ -20,4 +16,4 @@ COPY --from=builder /build /app
 
 VOLUME /config
 
-CMD [ "/app/bin/homebridge", "-U", "/config" ]
+CMD [ "/app/node_modules/homebridge/bin/homebridge", "-U", "/config" ]
