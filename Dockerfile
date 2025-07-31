@@ -6,7 +6,7 @@ WORKDIR /build
 
 RUN npm set prefix=/build
 
-RUN npm install --omit dev --build-from-source homebridge homebridge-dyson-pure-cool homebridge-dummy
+RUN npm install --omit dev --build-from-source homebridge homebridge-dyson-pure-cool
 
 FROM alpine
 
