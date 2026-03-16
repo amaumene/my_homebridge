@@ -17,3 +17,4 @@ COPY --from=builder /build /app
 VOLUME /config
 
 CMD [ "/app/node_modules/homebridge/bin/homebridge", "-U", "/config" ]
+
