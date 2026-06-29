@@ -28,8 +28,26 @@
       "pollInterval": {
         "title": "Poll Interval (seconds)",
         "type": "integer",
-        "default": 300,
+        "default": 120,
         "minimum": 60
+      },
+      "showDryMode": {
+        "title": "Show Dry mode switch",
+        "type": "boolean",
+        "default": true,
+        "description": "Uncheck to hide the Dry (dehumidify) switch."
+      },
+      "showAutoFan": {
+        "title": "Show Auto Fan switch",
+        "type": "boolean",
+        "default": true,
+        "description": "Uncheck to hide the Auto Fan switch."
+      },
+      "showSwingVertical": {
+        "title": "Show Swing Vertical switch",
+        "type": "boolean",
+        "default": true,
+        "description": "Uncheck to hide the Swing Vertical (louver swing) switch."
       }
     }
   }

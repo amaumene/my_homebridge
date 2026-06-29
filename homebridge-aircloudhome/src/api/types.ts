@@ -24,12 +24,6 @@ export type FanSpeed = "AUTO" | "LV1" | "LV2" | "LV3" | "LV4" | "LV5";
 /** Fan swing / louver setting. */
 export type FanSwing = "AUTO" | "OFF" | "VERTICAL" | "HORIZONTAL" | "BOTH";
 
-/** Modes in which a humidity setpoint is accepted by the API. */
-export const HUMIDITY_MODES: ReadonlySet<Mode> = new Set<Mode>([
-  "DRY",
-  "DRY_COOL",
-]);
-
 /**
  * Response body from `POST /iam/auth/sign-in` and
  * `POST /iam/auth/refresh-token`.
@@ -39,8 +33,10 @@ export const HUMIDITY_MODES: ReadonlySet<Mode> = new Set<Mode>([
 export interface AuthResponse {
   token: string;
   refreshToken: string;
-  access_token_expires_in: number;
-  refresh_token_expires_in: number;
+  /** Duration in ms. Absent on some refresh responses. */
+  access_token_expires_in?: number;
+  /** Duration in ms. Absent on refresh responses (only sign-in returns it). */
+  refresh_token_expires_in?: number;
 }
 
 /** A single family group the account belongs to. */
@@ -65,12 +61,23 @@ export interface Device {
   name: string;
   power: Power;
   mode: Mode;
+  /**
+   * In every mode except AUTO this is the absolute target setpoint (16-32 °C).
+   * In AUTO the cloud reuses this field for the relative comfort offset
+   * (-3..+3 °C, 0.5 step) and mirrors it into {@link relativeTemperature}.
+   */
   iduTemperature: number | null;
   roomTemperature: number | null;
+  /**
+   * AUTO-mode comfort offset (-3..+3 °C) reported by the cloud. Mirrors
+   * `iduTemperature` while in AUTO and is 0 in every other mode.
+   */
+  relativeTemperature?: number;
   fanSpeed: FanSpeed;
   fanSwing: FanSwing;
-  humidity?: number;
   online: boolean;
+  /** Cloud-reported critical fault flag, surfaced as HomeKit StatusFault. */
+  criticalError?: boolean;
   serialNumber?: string;
   model?: string;
   vendorThingId?: string;
@@ -87,13 +94,11 @@ export interface ControlCommand {
   fanSpeed?: FanSpeed;
   fanSwing?: FanSwing;
   iduTemperature?: number;
-  humidity?: number;
 }
 
 /**
  * Full control payload sent to the API. `power`, `mode`, `fanSpeed`,
- * `fanSwing` and `iduTemperature` are always present; `humidity` is included
- * only when the resulting mode accepts it (DRY / DRY_COOL).
+ * `fanSwing` and `iduTemperature` are always present.
  */
 export interface ControlPayload {
   power: Power;
@@ -101,5 +106,4 @@ export interface ControlPayload {
   fanSpeed: FanSpeed;
   fanSwing: FanSwing;
   iduTemperature: number;
-  humidity?: number;
 }

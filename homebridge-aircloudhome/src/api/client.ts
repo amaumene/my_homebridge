@@ -28,7 +28,6 @@ import {
   type Device,
   type FamilyGroup,
   type FamilyGroupsResponse,
-  HUMIDITY_MODES,
   type Mode,
 } from "./types.js";
 import { clamp, roundToStep } from "../utils.js";
@@ -44,6 +43,19 @@ const REQUEST_TIMEOUT_MS = 10_000;
  * for clock skew and network latency.
  */
 const EXPIRY_BUFFER_MS = 60_000;
+
+/**
+ * The cloud rejects a control command with HTTP 429 `command_in_progress` when
+ * a previous command for the same unit is still being applied. Rapid HomeKit
+ * interactions (toggling switches, changing mode) trigger this, so retry a few
+ * times with a short linear backoff before surfacing an error.
+ */
+const MAX_COMMAND_RETRIES = 3;
+const COMMAND_RETRY_DELAY_MS = 800;
+
+/** Promise-based delay. */
+const delay = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Minimal logger interface (compatible with Homebridge's Logger). */
 export interface LoggerLike {
@@ -63,11 +75,13 @@ export interface LoggerLike {
 interface RequestConfig extends AxiosRequestConfig {
   skipAuth?: boolean;
   _retried?: boolean;
+  _retry429?: number;
 }
 
 interface InternalRequestConfig extends InternalAxiosRequestConfig {
   skipAuth?: boolean;
   _retried?: boolean;
+  _retry429?: number;
 }
 
 /**
@@ -201,8 +215,17 @@ export class AirCloudHomeClient {
     const groups = await this.getFamilyGroups();
     const devices: Device[] = [];
     for (const group of groups) {
-      const idus = await this.getIduList(group.familyId);
-      devices.push(...idus);
+      try {
+        const idus = await this.getIduList(group.familyId);
+        devices.push(...idus);
+      } catch (error) {
+        // Don't let one failing family group blank out every other group's
+        // devices for the whole poll cycle; log and continue.
+        this.log?.warn(
+          `airCloud Home: failed to list devices for family ${group.familyId}:`,
+          error instanceof Error ? error.message : String(error),
+        );
+      }
     }
     return devices;
   }
@@ -216,12 +239,11 @@ export class AirCloudHomeClient {
    *
    * Builds a full payload by merging `changes` over the device's current known
    * state. `power`, `mode`, `fanSpeed`, `fanSwing` and `iduTemperature` are
-   * always sent. `humidity` is included only when the resulting mode is DRY or
-   * DRY_COOL (sending it otherwise yields HTTP 400).
+   * always sent.
    *
    * Value normalization:
-   *   - iduTemperature: rounded to nearest 0.5, clamped to 16–32.
-   *   - humidity: rounded to nearest 5, clamped to 40–60.
+   *   - iduTemperature: rounded to nearest 0.5; clamped to 16–32 in absolute
+   *     modes, or to the -3..+3 offset range in AUTO.
    *
    * @returns The updated device state reflecting the applied changes.
    */
@@ -240,9 +262,32 @@ export class AirCloudHomeClient {
     const fanSpeed = changes.fanSpeed ?? device.fanSpeed;
     const fanSwing = changes.fanSwing ?? device.fanSwing;
 
-    const rawTemperature =
-      changes.iduTemperature ?? device.iduTemperature ?? 22;
-    const iduTemperature = clamp(roundToStep(rawTemperature, 0.5), 16, 32);
+    // Temperature semantics depend on the mode. In AUTO the `iduTemperature`
+    // field carries a relative comfort offset (-3..+3 °C, 0.5 step); the cloud
+    // mirrors it into `relativeTemperature`. In every other mode it is an
+    // absolute setpoint (16-32 °C). Callers pass a device-native value (an
+    // offset in AUTO, an absolute setpoint otherwise), so the only per-mode
+    // work here is choosing the correct clamp range and base value.
+    const isAuto = mode === "AUTO";
+    const deviceInAuto = device.mode === "AUTO";
+    // `device.iduTemperature` is mode-polymorphic: an absolute setpoint outside
+    // AUTO, but the offset while in AUTO. Never read it across that boundary, or
+    // an AUTO offset (e.g. +2) would be misread as an absolute (and clamped to
+    // 16). When the target mode differs from the stored mode and the caller did
+    // not supply a value, fall back to a safe default; the accessory normally
+    // supplies an explicit setpoint on such transitions.
+    let baseNative: number;
+    if (isAuto) {
+      baseNative = deviceInAuto
+        ? (device.relativeTemperature ?? device.iduTemperature ?? 0)
+        : (device.relativeTemperature ?? 0);
+    } else {
+      baseNative = deviceInAuto ? 22 : (device.iduTemperature ?? 22);
+    }
+    const rawTemperature = changes.iduTemperature ?? baseNative;
+    const iduTemperature = isAuto
+      ? clamp(roundToStep(rawTemperature, 0.5), -3, 3)
+      : clamp(roundToStep(rawTemperature, 0.5), 16, 32);
 
     const payload: ControlPayload = {
       power,
@@ -251,20 +296,6 @@ export class AirCloudHomeClient {
       fanSwing,
       iduTemperature,
     };
-
-    // Include humidity only when the device actually reports it AND the
-    // effective state is ON + a humidity-capable mode (DRY / DRY_COOL).
-    // Never fabricate a default (matches the HA integration; avoids HTTP 400).
-    let appliedHumidity: number | undefined;
-    if (
-      device.humidity !== undefined &&
-      power === "ON" &&
-      HUMIDITY_MODES.has(mode)
-    ) {
-      const rawHumidity = changes.humidity ?? device.humidity;
-      appliedHumidity = clamp(roundToStep(rawHumidity, 5), 40, 60);
-      payload.humidity = appliedHumidity;
-    }
 
     await this.http.put(
       `/rac/basic-idu-control/general-control-command/${device.id}`,
@@ -282,12 +313,10 @@ export class AirCloudHomeClient {
       fanSpeed,
       fanSwing,
       iduTemperature,
-      // Always carry the caller‑requested humidity through the cache so it
-      // survives even when the current mode does not accept humidity (the API
-      // simply ignores it in an incompatible mode). appliedHumidity is the
-      // value that was actually sent to the API (DRY/DRY_COOL only); fall back
-      // to whatever the caller asked for, then the device's prior value.
-      humidity: changes.humidity ?? device.humidity,
+      // In AUTO the cloud mirrors the offset into relativeTemperature; reflect
+      // that optimistically so the accessory reads a consistent value before
+      // the next poll. Outside AUTO the offset is not meaningful.
+      relativeTemperature: isAuto ? iduTemperature : device.relativeTemperature,
       online: true, // a successful PUT proves connectivity
     };
   }
@@ -442,6 +471,23 @@ export class AirCloudHomeClient {
             return Promise.reject(
               this.toApiError(retryError, config.url ?? "request"),
             );
+          }
+        }
+
+        // 429: a prior command for this unit is still in progress. Back off and
+        // retry a bounded number of times before giving up.
+        if (status === 429 && config && !config.skipAuth) {
+          const attempt = config._retry429 ?? 0;
+          if (attempt < MAX_COMMAND_RETRIES) {
+            config._retry429 = attempt + 1;
+            await delay(COMMAND_RETRY_DELAY_MS * (attempt + 1));
+            try {
+              return await this.http.request(config);
+            } catch (retryError) {
+              return Promise.reject(
+                this.toApiError(retryError, config.url ?? "request"),
+              );
+            }
           }
         }
 

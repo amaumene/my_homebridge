@@ -31,16 +31,17 @@ function deviceFieldsEqual(a: Device, b: Device): boolean {
     a.power === b.power &&
     a.mode === b.mode &&
     a.iduTemperature === b.iduTemperature &&
+    a.relativeTemperature === b.relativeTemperature &&
     a.roomTemperature === b.roomTemperature &&
     a.fanSpeed === b.fanSpeed &&
     a.fanSwing === b.fanSwing &&
-    a.humidity === b.humidity &&
+    a.criticalError === b.criticalError &&
     a.online === b.online
   );
 }
 
 /** Default polling interval in seconds. */
-const DEFAULT_POLL_INTERVAL = 300;
+const DEFAULT_POLL_INTERVAL = 120;
 /** Minimum allowed polling interval in seconds. */
 const MIN_POLL_INTERVAL = 60;
 

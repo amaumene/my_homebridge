@@ -25,7 +25,6 @@ import type {
   FanSpeed,
   FanSwing,
 } from "./api/types.js";
-import { HUMIDITY_MODES } from "./api/types.js";
 import type { AirCloudHomePlatform } from "./platform.js";
 import { clamp, roundToStep } from "./utils.js";
 
@@ -47,6 +46,20 @@ const PCT_BY_LEVEL: Record<FanSpeed, number> = {
 
 /** Fallback target temperature when the device reports an unusable value. */
 const DEFAULT_TARGET_TEMP = 22;
+
+/**
+ * AUTO is a relative comfort offset, not an absolute setpoint (confirmed
+ * against the cloud and Hitachi's manuals: -3.0..+3.0 °C in 0.5° steps). The
+ * Home app's HeaterCooler tile can only render an absolute temperature, so the
+ * offset is presented around a 25 °C pivot, i.e. a 22-28 °C window (matching
+ * the Hitachi remote and the Overkiz integration). The device is always sent
+ * the raw offset; HomeKit displays pivot + offset.
+ */
+const AUTO_PIVOT = 25;
+const AUTO_OFFSET_MIN = -3;
+const AUTO_OFFSET_MAX = 3;
+const AUTO_DISPLAY_MIN = AUTO_PIVOT + AUTO_OFFSET_MIN; // 22
+const AUTO_DISPLAY_MAX = AUTO_PIVOT + AUTO_OFFSET_MAX; // 28
 
 /**
  * Seed a characteristic with a valid value BEFORE narrowing its props.
@@ -72,13 +85,9 @@ export class AirCloudHomeAccessory {
   private device: Device;
 
   private readonly service: Service;
-  private readonly dryService: Service;
-  private readonly fanOnlyService: Service;
-  private readonly dryCoolService: Service;
-  private readonly autoFanService: Service;
-  private readonly swingVService: Service;
-  private readonly swingHService: Service;
-  private readonly humidifierService?: Service;
+  private readonly dryService?: Service;
+  private readonly autoFanService?: Service;
+  private readonly swingVService?: Service;
 
   /** Serialized write queue tail. */
   private writeQueue: Promise<void> = Promise.resolve();
@@ -94,18 +103,29 @@ export class AirCloudHomeAccessory {
   /** Last manual (non-AUTO) fan slider percentage, used to restore the slider. */
   private lastManualSpeedPct = 60;
 
+  /**
+   * Last absolute setpoint (°C) seen while in a non-AUTO mode. Re-sent when the
+   * user switches from AUTO into Heat/Cool/Dry so the prior setpoint is
+   * restored instead of the API default (and never the AUTO offset).
+   */
+  private lastAbsoluteSetpoint = DEFAULT_TARGET_TEMP;
+
   /** Last known-good room temperature, used when the API reports null. */
   private lastGoodRoomTemp = 0;
 
   /**
-   * Last non-OFF swing direction set via the V/H switches or SwingMode toggle.
-   * Used as the target when the user re-enables swing.
+   * Last non-OFF swing setting reported by the unit. Used as the target when
+   * the user re-enables swing via the SwingMode toggle. Defaults to VERTICAL
+   * (this hardware supports OFF/VERTICAL/AUTO; HORIZONTAL/BOTH are rejected).
    */
-  private lastEffectiveSwing: FanSwing = "BOTH";
+  private lastEffectiveSwing: FanSwing = "VERTICAL";
 
   /** Pending threshold temperature debounce state. */
   private pendingTemp?: number;
   private tempTimer?: ReturnType<typeof setTimeout>;
+
+  /** Whether the threshold sliders are currently narrowed to the AUTO window. */
+  private thresholdAutoProps = false;
 
   constructor(
     private readonly platform: AirCloudHomePlatform,
@@ -119,56 +139,90 @@ export class AirCloudHomeAccessory {
     const info =
       this.accessory.getService(S.AccessoryInformation) ??
       this.accessory.addService(S.AccessoryInformation);
-    const model = this.device.model ?? "airCloud Home";
+    // `model` from the cloud is the brand string ("HITACHI"), so use it as the
+    // manufacturer and the vendor thing id as the model identifier. The cloud
+    // often reports a shared placeholder serial ("XXXX-XXXX-XXXX"); fall back to
+    // the unique device id so HomeKit does not treat multiple units as one.
+    const rawSerial = this.device.serialNumber;
+    const serial =
+      rawSerial && !/^[X-]+$/i.test(rawSerial) ? rawSerial : String(this.device.id);
     info
-      .setCharacteristic(C.Manufacturer, model)
-      .setCharacteristic(C.Model, model)
+      .setCharacteristic(C.Manufacturer, this.device.model ?? "Hitachi")
+      .setCharacteristic(C.Model, this.device.vendorThingId ?? "airCloud Home")
       .setCharacteristic(C.Name, this.device.name)
-      .setCharacteristic(
-        C.SerialNumber,
-        this.device.serialNumber ?? String(this.device.id),
-      )
-      .setCharacteristic(
-        C.FirmwareRevision,
-        this.device.vendorThingId ?? String(this.device.id),
-      );
+      .setCharacteristic(C.SerialNumber, serial);
 
     // --- HeaterCooler (primary) ----------------------------------------------
     this.service =
       this.accessory.getService(S.HeaterCooler) ??
       this.accessory.addService(S.HeaterCooler, this.device.name);
     this.service.setPrimaryService(true);
+    this.service.addOptionalCharacteristic(C.ConfiguredName);
+    this.service.setCharacteristic(C.ConfiguredName, this.device.name);
     this.setupHeaterCooler();
 
-    // --- Mode + fan + swing switches -----------------------------------------
-    this.dryService = this.setupSwitch("Dry", "mode-dry");
-    this.fanOnlyService = this.setupSwitch("Fan Only", "mode-fan");
-    this.dryCoolService = this.setupSwitch("Dry Cool", "mode-drycool");
-    this.autoFanService = this.setupSwitch("Auto Fan", "fan-auto");
-    this.swingVService = this.setupSwitch("Swing Vertical", "swing-v");
-    this.swingHService = this.setupSwitch("Swing Horizontal", "swing-h");
+    // --- Optional mode/fan/swing switches ------------------------------------
+    // Only the controls this hardware actually accepts (verified against the
+    // unit): Dry mode, Auto Fan, and vertical swing. Each can be hidden via
+    // config; a hidden switch is pruned from a restored accessory.
+    this.dryService = this.setupOptionalSwitch(
+      this.featureEnabled("showDryMode"),
+      "Dry",
+      "mode-dry",
+    );
+    this.autoFanService = this.setupOptionalSwitch(
+      this.featureEnabled("showAutoFan"),
+      "Auto Fan",
+      "fan-auto",
+    );
+    this.swingVService = this.setupOptionalSwitch(
+      this.featureEnabled("showSwingVertical"),
+      "Swing Vertical",
+      "swing-v",
+    );
 
     this.bindModeSwitches();
     this.bindAutoFanSwitch();
     this.bindSwingSwitches();
 
-    // --- HumidifierDehumidifier (only if device reports humidity) -------------
-    if (this.device.humidity !== undefined) {
-      this.humidifierService =
-        this.accessory.getService(S.HumidifierDehumidifier) ??
-        this.accessory.addService(S.HumidifierDehumidifier, this.device.name);
-      this.service.addLinkedService(this.humidifierService);
-      this.setupHumidifier();
-    } else {
-      // Capability dropped: remove a stale service from a restored accessory.
-      const stale = this.accessory.getService(S.HumidifierDehumidifier);
-      if (stale) {
-        this.accessory.removeService(stale);
-      }
+    // Prune services for features this hardware does not support (Fan Only,
+    // Dry Cool, Horizontal swing, Humidifier), including ones an older build of
+    // this plugin may have left on a restored accessory.
+    this.pruneStaleSwitch("mode-fan");
+    this.pruneStaleSwitch("mode-drycool");
+    this.pruneStaleSwitch("swing-h");
+    const staleHumidifier = this.accessory.getService(S.HumidifierDehumidifier);
+    if (staleHumidifier) {
+      this.accessory.removeService(staleHumidifier);
     }
 
     // Initial state push is deferred to the caller (platform's syncDevices
     // always calls update() immediately after construction).
+  }
+
+  /** Remove a switch service (by subtype) left on a restored accessory. */
+  private pruneStaleSwitch(subtype: string): void {
+    const stale = this.accessory.getServiceById(
+      this.platform.Service.Switch,
+      subtype,
+    );
+    if (stale) {
+      this.accessory.removeService(stale);
+    }
+  }
+
+  /**
+   * Current AUTO comfort offset (-3..+3 °C), read from the cloud's
+   * `relativeTemperature` (mirrored into `iduTemperature` while in AUTO).
+   */
+  private autoOffset(): number {
+    const raw = this.device.relativeTemperature ?? this.device.iduTemperature ?? 0;
+    const n = Number(raw);
+    return clamp(
+      roundToStep(Number.isNaN(n) ? 0 : n, 0.5),
+      AUTO_OFFSET_MIN,
+      AUTO_OFFSET_MAX,
+    );
   }
 
   /** Called by the poller with fresh device state. */
@@ -273,6 +327,42 @@ export class AirCloudHomeAccessory {
       .onSet(() => {
         /* Display units are fixed to Celsius; ignore writes. */
       });
+
+    // Surface the cloud's criticalError flag as a native HomeKit fault badge.
+    svc.addOptionalCharacteristic(C.StatusFault);
+    svc
+      .getCharacteristic(C.StatusFault)
+      .onGet(() => this.guardGet(() => this.statusFaultValue()));
+  }
+
+  /**
+   * Narrow the threshold sliders to the 22-28 AUTO window while in AUTO, and
+   * restore the full 16-32 range otherwise, so the AUTO comfort range is honest
+   * and the handle cannot be dragged past it. Only re-applied on change; seeds a
+   * valid mid value before narrowing to avoid a characteristic range warning.
+   */
+  private applyThresholdProps(auto: boolean): void {
+    if (auto === this.thresholdAutoProps) {
+      return;
+    }
+    this.thresholdAutoProps = auto;
+    const C = this.platform.Characteristic;
+    for (const ch of [
+      C.CoolingThresholdTemperature,
+      C.HeatingThresholdTemperature,
+    ]) {
+      const characteristic = this.service.getCharacteristic(ch);
+      if (auto) {
+        characteristic.updateValue(AUTO_PIVOT);
+        characteristic.setProps({
+          minValue: AUTO_DISPLAY_MIN,
+          maxValue: AUTO_DISPLAY_MAX,
+          minStep: 0.5,
+        });
+      } else {
+        characteristic.setProps({ minValue: 16, maxValue: 32, minStep: 0.5 });
+      }
+    }
   }
 
   private setupSwitch(displayName: string, subtype: string): Service {
@@ -289,11 +379,42 @@ export class AirCloudHomeAccessory {
     return svc;
   }
 
+  /**
+   * Read a boolean feature flag from the platform config. Defaults to true:
+   * a switch is hidden only when its flag is explicitly set to `false`.
+   */
+  private featureEnabled(key: string): boolean {
+    return this.platform.config[key] !== false;
+  }
+
+  /**
+   * Create a switch when `enabled`, or prune a stale one (left over from a
+   * previous config) when disabled. Returns undefined when the switch is
+   * hidden so callers can skip binding/pushing it.
+   */
+  private setupOptionalSwitch(
+    enabled: boolean,
+    displayName: string,
+    subtype: string,
+  ): Service | undefined {
+    if (!enabled) {
+      const stale = this.accessory.getServiceById(
+        this.platform.Service.Switch,
+        subtype,
+      );
+      if (stale) {
+        this.accessory.removeService(stale);
+      }
+      return undefined;
+    }
+    return this.setupSwitch(displayName, subtype);
+  }
+
   private bindModeSwitches(): void {
     const { Characteristic: C } = this.platform;
 
     this.dryService
-      .getCharacteristic(C.On)
+      ?.getCharacteristic(C.On)
       .onGet(() =>
         this.guardGet(
           () => this.device.power === "ON" && this.device.mode === "DRY",
@@ -307,43 +428,17 @@ export class AirCloudHomeAccessory {
         ),
       );
 
-    this.fanOnlyService
-      .getCharacteristic(C.On)
-      .onGet(() =>
-        this.guardGet(
-          () => this.device.power === "ON" && this.device.mode === "FAN",
-        ),
-      )
-      .onSet((value) =>
-        this.guardSet(() =>
-          this.applyControl(
-            value ? { power: "ON", mode: "FAN" } : { mode: "AUTO" },
-          ),
-        ),
-      );
-
-    this.dryCoolService
-      .getCharacteristic(C.On)
-      .onGet(() =>
-        this.guardGet(
-          () => this.device.power === "ON" && this.device.mode === "DRY_COOL",
-        ),
-      )
-      .onSet((value) =>
-        this.guardSet(() =>
-          // HA parity: clearing DRY_COOL falls back to DRY (not AUTO).
-          this.applyControl(
-            value ? { power: "ON", mode: "DRY_COOL" } : { mode: "DRY" },
-          ),
-        ),
-      );
   }
 
   private bindAutoFanSwitch(): void {
     const { Characteristic: C } = this.platform;
     this.autoFanService
-      .getCharacteristic(C.On)
-      .onGet(() => this.guardGet(() => this.device.fanSpeed === "AUTO"))
+      ?.getCharacteristic(C.On)
+      .onGet(() =>
+        this.guardGet(
+          () => this.device.power === "ON" && this.device.fanSpeed === "AUTO",
+        ),
+      )
       .onSet((value) =>
         this.guardSet(() => {
           if (value) {
@@ -357,136 +452,24 @@ export class AirCloudHomeAccessory {
   private bindSwingSwitches(): void {
     const { Characteristic: C } = this.platform;
 
+    // This hardware accepts only OFF / VERTICAL / AUTO swing (HORIZONTAL and
+    // BOTH are rejected), so the Vertical switch toggles VERTICAL vs OFF.
     this.swingVService
-      .getCharacteristic(C.On)
+      ?.getCharacteristic(C.On)
       .onGet(() =>
         this.guardGet(
           () =>
-            this.device.fanSwing === "VERTICAL" ||
-            this.device.fanSwing === "BOTH",
+            this.device.power === "ON" &&
+            this.device.fanSwing === "VERTICAL",
         ),
       )
       .onSet((value) =>
         this.guardSet(() => {
-          const hOn =
-            this.device.fanSwing === "HORIZONTAL" ||
-            this.device.fanSwing === "BOTH";
-          let result: FanSwing;
-          if (value) {
-            result = hOn ? "BOTH" : "VERTICAL";
-          } else {
-            result = hOn ? "HORIZONTAL" : "OFF";
-          }
+          const result: FanSwing = value ? "VERTICAL" : "OFF";
           if (result !== "OFF") {
             this.lastEffectiveSwing = result;
           }
           return this.applyControl({ fanSwing: result });
-        }),
-      );
-
-    this.swingHService
-      .getCharacteristic(C.On)
-      .onGet(() =>
-        this.guardGet(
-          () =>
-            this.device.fanSwing === "HORIZONTAL" ||
-            this.device.fanSwing === "BOTH",
-        ),
-      )
-      .onSet((value) =>
-        this.guardSet(() => {
-          const vOn =
-            this.device.fanSwing === "VERTICAL" ||
-            this.device.fanSwing === "BOTH";
-          let result: FanSwing;
-          if (value) {
-            result = vOn ? "BOTH" : "HORIZONTAL";
-          } else {
-            result = vOn ? "VERTICAL" : "OFF";
-          }
-          if (result !== "OFF") {
-            this.lastEffectiveSwing = result;
-          }
-          return this.applyControl({ fanSwing: result });
-        }),
-      );
-  }
-
-  private setupHumidifier(): void {
-    const { Characteristic: C } = this.platform;
-    const svc = this.humidifierService;
-    if (!svc) {
-      return;
-    }
-
-    // Humidifier Active is read‑only: it indicates whether dehumidification is
-    // currently running (power ON + DRY/DRY_COOL mode). Mode selection is
-    // handled by the dedicated Dry / Dry Cool switches and the HeaterCooler.
-    // Drop the write perm so the Home app shows it as a status indicator
-    // rather than a toggle that silently springs back.
-    const { Perms } = this.platform.api.hap;
-    svc
-      .getCharacteristic(C.Active)
-      .setProps({ perms: [Perms.PAIRED_READ, Perms.NOTIFY] })
-      .onGet(() => this.guardGet(() => this.humidifierActiveValue()));
-
-    svc
-      .getCharacteristic(C.CurrentHumidifierDehumidifierState)
-      .setProps({
-        validValues: [
-          C.CurrentHumidifierDehumidifierState.INACTIVE,
-          C.CurrentHumidifierDehumidifierState.IDLE,
-          C.CurrentHumidifierDehumidifierState.DEHUMIDIFYING,
-        ],
-      })
-      .onGet(() => this.guardGet(() => this.humidifierCurrentState()));
-
-    seedProps(
-      svc.getCharacteristic(C.TargetHumidifierDehumidifierState),
-      C.TargetHumidifierDehumidifierState.DEHUMIDIFIER,
-      { validValues: [C.TargetHumidifierDehumidifierState.DEHUMIDIFIER] },
-    )
-      .onGet(() => C.TargetHumidifierDehumidifierState.DEHUMIDIFIER)
-      .onSet(() => {
-        /* Dehumidifier-only; target state is fixed. */
-      });
-
-    svc
-      .getCharacteristic(C.CurrentRelativeHumidity)
-      .onGet(() => this.guardGet(() => this.humidityValue()));
-
-    // humidityValue() is always 40–60 (valid against the default 0–100).
-    seedProps(
-      svc.getCharacteristic(C.RelativeHumidityDehumidifierThreshold),
-      this.humidityValue(),
-      { minValue: 40, maxValue: 60, minStep: 5 },
-    )
-      .onGet(() => this.guardGet(() => this.humidityValue()))
-      .onSet((value) =>
-        this.guardSet(() => {
-          const v = clamp(roundToStep(Number(value), 5), 40, 60);
-          // Cache the desired humidity inside the write queue so the mutation
-          // is serialised with other writes and the merged read is race-free.
-          // The API ignores humidity outside DRY/DRY_COOL modes; caching here
-          // ensures the desired value survives until the mode changes.
-          return this.enqueue(async () => {
-            this.device = { ...this.device, humidity: v };
-            this.accessory.context.device = this.device;
-            try {
-              this.device = await this.platform.client.control(
-                this.device,
-                { humidity: v },
-              );
-              this.accessory.context.device = this.device;
-            } catch (error) {
-              this.platform.log.warn(
-                `Control failed for ${this.device.name}:`,
-                error instanceof Error ? error.message : String(error),
-              );
-              throw this.commError();
-            }
-            this.pushAll();
-          });
         }),
       );
   }
@@ -500,6 +483,11 @@ export class AirCloudHomeAccessory {
     return this.device.power === "ON" ? C.Active.ACTIVE : C.Active.INACTIVE;
   }
 
+  private statusFaultValue(): CharacteristicValue {
+    const C = this.platform.Characteristic.StatusFault;
+    return this.device.criticalError ? C.GENERAL_FAULT : C.NO_FAULT;
+  }
+
   /** Room temperature, coalesced to a safe number (never null/undefined/NaN). */
   private currentTemperatureValue(): CharacteristicValue {
     const room = this.device.roomTemperature;
@@ -511,23 +499,25 @@ export class AirCloudHomeAccessory {
   }
 
   /**
-   * Target (IDU) temperature, coalesced to a safe number and clamped to the
-   * HomeKit 16–32 range (defaults to 22 when the API omits/garbles it).
+   * Target temperature shown on the HeaterCooler tile.
+   *
+   * AUTO: a relative offset, presented as pivot + offset (22-28 °C window).
+   * Other modes: the absolute IDU setpoint, clamped to the HomeKit 16-32 range
+   * (defaults to 22 when the API omits/garbles it).
    */
   private targetTemperatureValue(): CharacteristicValue {
+    if (this.device.mode === "AUTO") {
+      return clamp(
+        AUTO_PIVOT + this.autoOffset(),
+        AUTO_DISPLAY_MIN,
+        AUTO_DISPLAY_MAX,
+      );
+    }
     const idu = this.device.iduTemperature;
     if (idu === null || idu === undefined || Number.isNaN(idu)) {
       return DEFAULT_TARGET_TEMP;
     }
     return clamp(idu, 16, 32);
-  }
-
-  /**
-   * Humidity setpoint, rounded to the nearest 5 and clamped to the HomeKit
-   * 40–60 range (defaults to 50 when unset).
-   */
-  private humidityValue(): CharacteristicValue {
-    return clamp(roundToStep(this.device.humidity ?? 50, 5), 40, 60);
   }
 
   private currentHeaterCoolerState(): CharacteristicValue {
@@ -552,11 +542,15 @@ export class AirCloudHomeAccessory {
         return room < idu ? state.HEATING : state.IDLE;
       case "COOLING":
         return room > idu ? state.COOLING : state.IDLE;
-      case "AUTO":
-        if (room > idu) {
+      case "AUTO": {
+        // In AUTO `idu` is an offset, not an absolute target. Compare the room
+        // against the effective target (pivot + offset) instead.
+        const target = AUTO_PIVOT + this.autoOffset();
+        if (room > target) {
           return state.COOLING;
         }
-        return room < idu ? state.HEATING : state.IDLE;
+        return room < target ? state.HEATING : state.IDLE;
+      }
       case "DRY":
       case "DRY_COOL":
         return state.COOLING;
@@ -586,28 +580,11 @@ export class AirCloudHomeAccessory {
 
   private swingModeValue(): CharacteristicValue {
     const C = this.platform.Characteristic.SwingMode;
-    // ENABLED for any active swing (directional or AUTO), DISABLED only
-    // when louver is fully off.  The V/H switches handle direction fine‑tuning.
+    // ENABLED for any active swing (VERTICAL or AUTO), DISABLED when the louver
+    // is off. The Swing Vertical switch selects VERTICAL specifically.
     return this.device.fanSwing !== "OFF"
       ? C.SWING_ENABLED
       : C.SWING_DISABLED;
-  }
-
-  private humidifierActiveValue(): CharacteristicValue {
-    const C = this.platform.Characteristic.Active;
-    const active =
-      this.device.power === "ON" && HUMIDITY_MODES.has(this.device.mode);
-    return active ? C.ACTIVE : C.INACTIVE;
-  }
-
-  private humidifierCurrentState(): CharacteristicValue {
-    const state = this.platform.Characteristic.CurrentHumidifierDehumidifierState;
-    if (this.device.power !== "ON") {
-      return state.INACTIVE;
-    }
-    return HUMIDITY_MODES.has(this.device.mode)
-      ? state.DEHUMIDIFYING
-      : state.IDLE;
   }
 
   // ===========================================================================
@@ -653,9 +630,22 @@ export class AirCloudHomeAccessory {
     return this.applyControl({ fanSwing });
   }
 
-  /** Debounce threshold temperature writes and apply the last value. */
+  /**
+   * Debounce threshold temperature writes and apply the last value.
+   *
+   * `value` is the absolute temperature shown on the HomeKit slider. In AUTO it
+   * is converted to the device-native offset (display - pivot, clamped to
+   * ±3); in other modes it is the absolute setpoint (clamped to 16-32).
+   */
   private scheduleThresholdWrite(value: CharacteristicValue): void {
-    this.pendingTemp = clamp(roundToStep(Number(value), 0.5), 16, 32);
+    this.pendingTemp =
+      this.device.mode === "AUTO"
+        ? clamp(
+            roundToStep(Number(value) - AUTO_PIVOT, 0.5),
+            AUTO_OFFSET_MIN,
+            AUTO_OFFSET_MAX,
+          )
+        : clamp(roundToStep(Number(value), 0.5), 16, 32);
     if (this.tempTimer) {
       clearTimeout(this.tempTimer);
     }
@@ -702,6 +692,15 @@ export class AirCloudHomeAccessory {
    * queued task) so serialized writes compose instead of clobbering each other.
    */
   private applyControl(changes: ControlCommand): Promise<void> {
+    // Entering (or staying in) an absolute mode without an explicit setpoint:
+    // supply the remembered absolute value. This both preserves the user's
+    // setpoint across an AUTO→Heat/Cool switch and prevents the client from
+    // falling back to a default. AUTO changes are left alone (the client uses
+    // the relative offset as the base).
+    const resultMode = changes.mode ?? this.device.mode;
+    if (resultMode !== "AUTO" && changes.iduTemperature === undefined) {
+      changes = { ...changes, iduTemperature: this.lastAbsoluteSetpoint };
+    }
     return this.enqueue(async () => {
       try {
         this.device = await this.platform.client.control(this.device, changes);
@@ -752,6 +751,13 @@ export class AirCloudHomeAccessory {
   private pushAll(): void {
     const C = this.platform.Characteristic;
 
+    // Track the unit's actual last non-OFF swing (including AUTO and
+    // vertical-only units) so the SwingMode toggle restores what this hardware
+    // really uses instead of a hardcoded BOTH.
+    if (this.device.fanSwing !== "OFF") {
+      this.lastEffectiveSwing = this.device.fanSwing;
+    }
+
     // HeaterCooler
     this.push(this.service, C.Active, this.activeValue());
     this.push(
@@ -772,88 +778,53 @@ export class AirCloudHomeAccessory {
     // While a threshold write is debouncing, don't push iduTemperature back —
     // it would revert the slider mid-drag.
     if (this.tempTimer === undefined) {
+      // One absolute-looking setpoint per mode. In AUTO this is pivot+offset
+      // (22-28); otherwise it is the absolute setpoint. The Home app still
+      // renders two handles in AUTO, but parking both on the same value makes
+      // them move together as one setpoint. Dragging either writes the same
+      // value (offset in AUTO, absolute otherwise).
+      this.applyThresholdProps(this.device.mode === "AUTO");
       const target = this.targetTemperatureValue();
-      if (this.device.mode === "AUTO") {
-        // Single-setpoint device: present a 0.5 °C spread between the two
-        // thresholds so the Home app's dual-handle range does not collapse
-        // to a zero-width band (which triggers visible UI oscillation).
-        // Clamp each handle into the 16–32 props range so the spread survives
-        // at the extremes without emitting HAP out-of-range warnings.
-        // The device receives one iduTemperature regardless of which handle
-        // the user drags.
-        const t = Number(target);
-        const cooling = Math.min(t + 0.5, 32);
-        const heating = Math.max(t - 0.5, 16);
-        this.push(this.service, C.CoolingThresholdTemperature, cooling);
-        this.push(this.service, C.HeatingThresholdTemperature, heating);
-      } else {
-        this.push(this.service, C.CoolingThresholdTemperature, target);
-        this.push(this.service, C.HeatingThresholdTemperature, target);
+      // Remember the absolute setpoint so an AUTO→Heat/Cool switch can restore
+      // it (see applyControl). Skip AUTO, where `target` is pivot+offset.
+      if (this.device.mode !== "AUTO") {
+        this.lastAbsoluteSetpoint = Number(target);
       }
+      this.push(this.service, C.CoolingThresholdTemperature, target);
+      this.push(this.service, C.HeatingThresholdTemperature, target);
     }
     this.push(this.service, C.RotationSpeed, this.rotationSpeedValue());
     this.push(this.service, C.SwingMode, this.swingModeValue());
+    this.push(this.service, C.StatusFault, this.statusFaultValue());
 
     // Mode + fan + swing switches
+    const on = this.device.power === "ON";
     this.push(
       this.dryService,
       C.On,
-      this.device.power === "ON" && this.device.mode === "DRY",
+      on && this.device.mode === "DRY",
     );
     this.push(
-      this.fanOnlyService,
+      this.autoFanService,
       C.On,
-      this.device.power === "ON" && this.device.mode === "FAN",
+      on && this.device.fanSpeed === "AUTO",
     );
-    this.push(
-      this.dryCoolService,
-      C.On,
-      this.device.power === "ON" && this.device.mode === "DRY_COOL",
-    );
-    this.push(this.autoFanService, C.On, this.device.fanSpeed === "AUTO");
     this.push(
       this.swingVService,
       C.On,
-      this.device.fanSwing === "VERTICAL" || this.device.fanSwing === "BOTH",
+      on && this.device.fanSwing === "VERTICAL",
     );
-    this.push(
-      this.swingHService,
-      C.On,
-      this.device.fanSwing === "HORIZONTAL" || this.device.fanSwing === "BOTH",
-    );
-
-    // HumidifierDehumidifier
-    if (this.humidifierService) {
-      this.push(
-        this.humidifierService,
-        C.Active,
-        this.humidifierActiveValue(),
-      );
-      this.push(
-        this.humidifierService,
-        C.CurrentHumidifierDehumidifierState,
-        this.humidifierCurrentState(),
-      );
-      const humidity = this.humidityValue();
-      this.push(
-        this.humidifierService,
-        C.CurrentRelativeHumidity,
-        humidity,
-      );
-      this.push(
-        this.humidifierService,
-        C.RelativeHumidityDehumidifierThreshold,
-        humidity,
-      );
-    }
   }
 
   /** Update one characteristic, or mark it No-Response when offline. */
   private push(
-    service: Service,
+    service: Service | undefined,
     characteristic: CharLike,
     value: CharacteristicValue,
   ): void {
+    if (!service) {
+      return;
+    }
     if (this.device.online) {
       service.updateCharacteristic(characteristic, value);
     } else {
