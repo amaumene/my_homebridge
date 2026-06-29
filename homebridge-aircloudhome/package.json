@@ -1,0 +1,44 @@
+{
+  "name": "homebridge-aircloudhome",
+  "displayName": "Shirokuma AC (airCloud Home)",
+  "version": "1.0.0",
+  "description": "Homebridge plugin for Hitachi / Shirokuma air conditioners via the airCloud Home cloud API.",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "engines": {
+    "homebridge": "^1.8.0 || ^2.0.0-beta.0",
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "rimraf ./dist && tsc",
+    "lint": "eslint src/**/*.ts",
+    "watch": "nodemon",
+    "prepublishOnly": "npm run lint && npm run build"
+  },
+  "keywords": [
+    "homebridge-plugin",
+    "hitachi",
+    "aircloud",
+    "aircloudhome",
+    "shirokuma",
+    "air-conditioner",
+    "heatercooler"
+  ],
+  "dependencies": {
+    "axios": "^1.18.1"
+  },
+  "files": [
+    "dist",
+    "config.schema.json"
+  ],
+  "devDependencies": {
+    "@types/node": "^24",
+    "@typescript-eslint/eslint-plugin": "^8.18.0",
+    "@typescript-eslint/parser": "^8.18.0",
+    "eslint": "^9",
+    "homebridge": "^1.8.0",
+    "nodemon": "^3",
+    "rimraf": "^6",
+    "typescript": "^5.5"
+  }
+}
