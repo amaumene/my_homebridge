@@ -13,6 +13,7 @@
  */
 
 import type {
+  Characteristic,
   CharacteristicValue,
   PlatformAccessory,
   Service,
@@ -46,6 +47,26 @@ const PCT_BY_LEVEL: Record<FanSpeed, number> = {
 
 /** Fallback target temperature when the device reports an unusable value. */
 const DEFAULT_TARGET_TEMP = 22;
+
+/**
+ * Seed a characteristic with a valid value BEFORE narrowing its props.
+ *
+ * hap-nodejs validates the characteristic's current value inside `setProps`
+ * and emits a characteristic warning (then clamps) if that value falls outside
+ * the new range/validValues. On a fresh accessory the current value is the HAP
+ * default (e.g. CoolingThreshold 10, HeatingThreshold 0, RotationSpeed 0), so
+ * narrowing the range warns. Seeding a valid value first avoids it.
+ *
+ * The seed must be valid against BOTH the characteristic's default range and
+ * the narrowed range. Returns the characteristic for chaining.
+ */
+function seedProps(
+  characteristic: Characteristic,
+  seed: CharacteristicValue,
+  props: Parameters<Characteristic["setProps"]>[0],
+): Characteristic {
+  return characteristic.updateValue(seed).setProps(props);
+}
 
 export class AirCloudHomeAccessory {
   private device: Device;
@@ -211,9 +232,15 @@ export class AirCloudHomeAccessory {
       C.CoolingThresholdTemperature,
       C.HeatingThresholdTemperature,
     ]) {
-      svc
-        .getCharacteristic(characteristic)
-        .setProps({ minValue: 16, maxValue: 32, minStep: 0.5 })
+      // Seed a fixed mid-range constant, not the live setpoint:
+      // HeatingThresholdTemperature's DEFAULT range is 0–25, so seeding a live
+      // value > 25 (e.g. a 30 °C heat setpoint) would itself warn. 22 is valid
+      // in every relevant range. update() overwrites it with real state.
+      seedProps(svc.getCharacteristic(characteristic), DEFAULT_TARGET_TEMP, {
+        minValue: 16,
+        maxValue: 32,
+        minStep: 0.5,
+      })
         .onGet(() => this.guardGet(() => this.targetTemperatureValue()))
         .onSet((value) =>
           this.guardSet(() => {
@@ -225,9 +252,12 @@ export class AirCloudHomeAccessory {
     // RotationSpeed cannot represent AUTO (fan level 0), so the slider shows
     // the last-used manual speed when the fan is in AUTO mode.  The "Auto Fan"
     // linked switch is the canonical AUTO/off toggle.
-    svc
-      .getCharacteristic(C.RotationSpeed)
-      .setProps({ minValue: 20, maxValue: 100, minStep: 20 })
+    // rotationSpeedValue() is always 20–100 (valid against the default 0–100).
+    seedProps(svc.getCharacteristic(C.RotationSpeed), this.rotationSpeedValue(), {
+      minValue: 20,
+      maxValue: 100,
+      minStep: 20,
+    })
       .onGet(() => this.guardGet(() => this.rotationSpeedValue()))
       .onSet((value) => this.guardSet(() => this.setRotationSpeed(value)));
 
@@ -251,6 +281,9 @@ export class AirCloudHomeAccessory {
       this.accessory.getServiceById(S.Switch, subtype) ??
       this.accessory.addService(S.Switch, displayName, subtype);
     svc.setCharacteristic(C.Name, displayName);
+    // The Switch service does not list ConfiguredName as optional, so setting
+    // it directly logs an "Adding anyway" warning. Register it first.
+    svc.addOptionalCharacteristic(C.ConfiguredName);
     svc.setCharacteristic(C.ConfiguredName, displayName);
     this.service.addLinkedService(svc);
     return svc;
@@ -408,11 +441,11 @@ export class AirCloudHomeAccessory {
       })
       .onGet(() => this.guardGet(() => this.humidifierCurrentState()));
 
-    svc
-      .getCharacteristic(C.TargetHumidifierDehumidifierState)
-      .setProps({
-        validValues: [C.TargetHumidifierDehumidifierState.DEHUMIDIFIER],
-      })
+    seedProps(
+      svc.getCharacteristic(C.TargetHumidifierDehumidifierState),
+      C.TargetHumidifierDehumidifierState.DEHUMIDIFIER,
+      { validValues: [C.TargetHumidifierDehumidifierState.DEHUMIDIFIER] },
+    )
       .onGet(() => C.TargetHumidifierDehumidifierState.DEHUMIDIFIER)
       .onSet(() => {
         /* Dehumidifier-only; target state is fixed. */
@@ -422,9 +455,12 @@ export class AirCloudHomeAccessory {
       .getCharacteristic(C.CurrentRelativeHumidity)
       .onGet(() => this.guardGet(() => this.humidityValue()));
 
-    svc
-      .getCharacteristic(C.RelativeHumidityDehumidifierThreshold)
-      .setProps({ minValue: 40, maxValue: 60, minStep: 5 })
+    // humidityValue() is always 40–60 (valid against the default 0–100).
+    seedProps(
+      svc.getCharacteristic(C.RelativeHumidityDehumidifierThreshold),
+      this.humidityValue(),
+      { minValue: 40, maxValue: 60, minStep: 5 },
+    )
       .onGet(() => this.guardGet(() => this.humidityValue()))
       .onSet((value) =>
         this.guardSet(() => {
