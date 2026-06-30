@@ -455,12 +455,16 @@ export class AirCloudHomeAccessory {
       )
       .onSet((value) =>
         this.guardSet(() =>
+          // Dry is a dehumidify modifier on cooling and is shown as Cool on the
+          // main card, so turning it off drops to plain Cool (not Auto). Power
+          // is left unchanged; the setpoint is preserved via applyControl.
           this.applyControl(
-            value ? { power: "ON", mode: "DRY" } : { mode: "AUTO" },
+            value
+              ? { power: "ON", mode: "DRY" }
+              : { mode: "COOLING" },
           ),
         ),
       );
-
   }
 
   private bindAutoFanSwitch(): void {
@@ -596,6 +600,13 @@ export class AirCloudHomeAccessory {
         return state.HEAT;
       case "COOLING":
         return state.COOL;
+      case "DRY":
+      case "DRY_COOL":
+        // HomeKit's climate card has no Dry mode. Present Dry as Cool so the
+        // main card shows a single, settable temperature (Dry accepts an
+        // absolute setpoint). The "Dry" switch remains the way to enter Dry,
+        // and distinguishes Dry from plain Cool.
+        return state.COOL;
       default:
         return state.AUTO;
     }
@@ -726,14 +737,18 @@ export class AirCloudHomeAccessory {
    * queued task) so serialized writes compose instead of clobbering each other.
    */
   private applyControl(changes: ControlCommand): Promise<void> {
-    // Entering (or staying in) an absolute mode without an explicit setpoint:
-    // supply the remembered absolute value. This both preserves the user's
-    // setpoint across an AUTO→Heat/Cool switch and prevents the client from
-    // falling back to a default. AUTO changes are left alone (the client uses
-    // the relative offset as the base).
+    // Entering an absolute mode without an explicit setpoint: choose the
+    // temperature to send. Leaving AUTO (which has no absolute setpoint) carries
+    // over the value the AUTO tile was showing — pivot + offset — so Cool/Heat
+    // starts at the temperature the user saw, not an arbitrary default. Any
+    // other transition reuses the remembered absolute setpoint.
     const resultMode = changes.mode ?? this.device.mode;
     if (resultMode !== "AUTO" && changes.iduTemperature === undefined) {
-      changes = { ...changes, iduTemperature: this.lastAbsoluteSetpoint };
+      const setpoint =
+        this.device.mode === "AUTO"
+          ? clamp(AUTO_PIVOT + this.autoOffset(), 16, 32)
+          : this.lastAbsoluteSetpoint;
+      changes = { ...changes, iduTemperature: setpoint };
     }
     return this.enqueue(async () => {
       try {
