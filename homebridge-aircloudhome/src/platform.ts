@@ -165,20 +165,21 @@ export class AirCloudHomePlatform implements DynamicPlatformPlugin {
 
       const existing = this.accessories.find((acc) => acc.UUID === uuid);
       if (existing) {
-        const changed = !deviceFieldsEqual(existing.context.device, device);
-        if (changed) {
-          existing.context.device = device;
-          this.api.updatePlatformAccessories([existing]);
-        }
         const handler =
           this.handlers.get(uuid) ??
           new AirCloudHomeAccessory(this, existing);
-        // Skip state push when writes are in-flight; the next poll will
-        // deliver authoritative server state after the command settles.
-        if (!handler.hasPendingWrites) {
+        this.handlers.set(uuid, handler);
+        // Skip while a write is in-flight, or a recent write has not yet been
+        // confirmed by the cloud (it reflects writes with tens of seconds of
+        // lag); otherwise a lagging poll would revert the optimistic state.
+        // Only overwrite the cached context when we actually accept the poll.
+        if (!handler.hasPendingWrites && !handler.isPollSuppressed(device)) {
+          if (!deviceFieldsEqual(existing.context.device, device)) {
+            existing.context.device = device;
+            this.api.updatePlatformAccessories([existing]);
+          }
           handler.update(device);
         }
-        this.handlers.set(uuid, handler);
       } else {
         this.log.info("Registering new accessory:", device.name);
         const accessory = new this.api.platformAccessory(device.name, uuid);

@@ -62,6 +62,13 @@ const AUTO_DISPLAY_MIN = AUTO_PIVOT + AUTO_OFFSET_MIN; // 22
 const AUTO_DISPLAY_MAX = AUTO_PIVOT + AUTO_OFFSET_MAX; // 28
 
 /**
+ * After a successful write, ignore polls that still report the pre-command
+ * state for this long. The cloud reflects writes with tens of seconds of lag,
+ * so an early poll would otherwise revert the optimistic state.
+ */
+const POLL_SUPPRESS_MS = 90_000;
+
+/**
  * Seed a characteristic with a valid value BEFORE narrowing its props.
  *
  * hap-nodejs validates the characteristic's current value inside `setProps`
@@ -126,6 +133,9 @@ export class AirCloudHomeAccessory {
 
   /** Whether the threshold sliders are currently narrowed to the AUTO window. */
   private thresholdAutoProps = false;
+
+  /** Until this epoch (ms), ignore polls that contradict a just-written state. */
+  private pollSuppressUntil = 0;
 
   constructor(
     private readonly platform: AirCloudHomePlatform,
@@ -227,9 +237,32 @@ export class AirCloudHomeAccessory {
 
   /** Called by the poller with fresh device state. */
   update(device: Device): void {
+    this.pollSuppressUntil = 0; // poll accepted: the write is reconciled
     this.device = device;
     this.accessory.context.device = device;
     this.pushAll();
+  }
+
+  /**
+   * True while a recent write's optimistic state must be protected from a poll
+   * that still reports the pre-command value (the cloud reflects writes with
+   * tens of seconds of lag). False once the poll agrees (confirmed) or the
+   * window expires (treated as an external change).
+   */
+  isPollSuppressed(incoming: Device): boolean {
+    return Date.now() < this.pollSuppressUntil && !this.pollAgrees(incoming);
+  }
+
+  /** Whether an incoming poll matches the current (optimistic) commanded state. */
+  private pollAgrees(d: Device): boolean {
+    return (
+      d.power === this.device.power &&
+      d.mode === this.device.mode &&
+      d.fanSpeed === this.device.fanSpeed &&
+      d.fanSwing === this.device.fanSwing &&
+      d.iduTemperature === this.device.iduTemperature &&
+      d.relativeTemperature === this.device.relativeTemperature
+    );
   }
 
   /** Release timers held by this accessory (called on platform shutdown). */
@@ -440,12 +473,13 @@ export class AirCloudHomeAccessory {
         ),
       )
       .onSet((value) =>
-        this.guardSet(() => {
-          if (value) {
-            return this.applyControl({ fanSpeed: "AUTO" });
-          }
-          return this.applyControl({ fanSpeed: this.manualFanSpeed() });
-        }),
+        this.guardSet(() =>
+          // Powering on when enabling keeps the switch truthful (fan settings
+          // only apply while running) and avoids a spring-back when off.
+          value
+            ? this.applyControl({ power: "ON", fanSpeed: "AUTO" })
+            : this.applyControl({ fanSpeed: this.manualFanSpeed() }),
+        ),
       );
   }
 
@@ -465,11 +499,11 @@ export class AirCloudHomeAccessory {
       )
       .onSet((value) =>
         this.guardSet(() => {
-          const result: FanSwing = value ? "VERTICAL" : "OFF";
-          if (result !== "OFF") {
-            this.lastEffectiveSwing = result;
+          if (value) {
+            this.lastEffectiveSwing = "VERTICAL";
+            return this.applyControl({ power: "ON", fanSwing: "VERTICAL" });
           }
-          return this.applyControl({ fanSwing: result });
+          return this.applyControl({ fanSwing: "OFF" });
         }),
       );
   }
@@ -525,16 +559,21 @@ export class AirCloudHomeAccessory {
     if (this.device.power !== "ON") {
       return state.INACTIVE;
     }
-    const { mode, roomTemperature: room, iduTemperature: idu } = this.device;
-    // Without a valid room/target temperature we cannot infer heat/cool/idle.
-    if (
-      room === null ||
-      room === undefined ||
-      Number.isNaN(room) ||
-      idu === null ||
-      idu === undefined ||
-      Number.isNaN(idu)
-    ) {
+    const { mode, roomTemperature: room } = this.device;
+    if (room === null || room === undefined || Number.isNaN(room)) {
+      return state.IDLE;
+    }
+    // AUTO derives its target from the offset (relativeTemperature), not the
+    // mode-polymorphic iduTemperature, so handle it before the idu guard.
+    if (mode === "AUTO") {
+      const target = AUTO_PIVOT + this.autoOffset();
+      if (room > target) {
+        return state.COOLING;
+      }
+      return room < target ? state.HEATING : state.IDLE;
+    }
+    const idu = this.device.iduTemperature;
+    if (idu === null || idu === undefined || Number.isNaN(idu)) {
       return state.IDLE;
     }
     switch (mode) {
@@ -542,15 +581,6 @@ export class AirCloudHomeAccessory {
         return room < idu ? state.HEATING : state.IDLE;
       case "COOLING":
         return room > idu ? state.COOLING : state.IDLE;
-      case "AUTO": {
-        // In AUTO `idu` is an offset, not an absolute target. Compare the room
-        // against the effective target (pivot + offset) instead.
-        const target = AUTO_PIVOT + this.autoOffset();
-        if (room > target) {
-          return state.COOLING;
-        }
-        return room < target ? state.HEATING : state.IDLE;
-      }
       case "DRY":
       case "DRY_COOL":
         return state.COOLING;
@@ -594,9 +624,12 @@ export class AirCloudHomeAccessory {
   private setActive(value: CharacteristicValue): Promise<void> {
     const C = this.platform.Characteristic;
     if (value === C.Active.ACTIVE) {
-      // Preserve the last mode across OFF (HA parity), defaulting to AUTO.
-      const mode = this.device.mode ?? "AUTO";
-      return this.applyControl({ power: "ON", mode });
+      // Send power only. `mode` is resolved from the device at execution time
+      // inside the serialized write queue (preserving the last mode across OFF),
+      // so this cannot race a concurrent TargetHeaterCoolerState write when the
+      // user turns the unit on by tapping Heat/Cool (which previously let a
+      // stale AUTO land after the new mode and revert it).
+      return this.applyControl({ power: "ON" });
     }
     return this.applyControl({ power: "OFF" });
   }
@@ -656,8 +689,9 @@ export class AirCloudHomeAccessory {
       if (temperature === undefined) {
         return;
       }
-      // applyControl already enqueues; do not double-wrap.
-      void this.applyControl({ iduTemperature: temperature });
+      // applyControl already enqueues; do not double-wrap. Swallow rejection so
+      // a failed debounced write does not surface as an unhandledRejection.
+      void this.applyControl({ iduTemperature: temperature }).catch(() => {});
     }, TEMP_DEBOUNCE_MS);
   }
 
@@ -717,6 +751,9 @@ export class AirCloudHomeAccessory {
         throw this.commError();
       }
       this.pushAll();
+      // Protect this optimistic state from a lagging poll until the cloud
+      // confirms it (see isPollSuppressed). Only set on success.
+      this.pollSuppressUntil = Date.now() + POLL_SUPPRESS_MS;
     });
   }
 
