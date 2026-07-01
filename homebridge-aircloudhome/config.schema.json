@@ -48,6 +48,12 @@
         "type": "boolean",
         "default": true,
         "description": "Uncheck to hide the Swing Vertical (louver swing) switch."
+      },
+      "showForceOff": {
+        "title": "Show Force Off switch",
+        "type": "boolean",
+        "default": true,
+        "description": "Momentary button that sends OFF twice to stop the internal-clean drying fan that keeps running after a normal off. Uncheck to hide it."
       }
     }
   }

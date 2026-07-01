@@ -34,6 +34,19 @@ type CharLike = Parameters<Service["updateCharacteristic"]>[0];
 /** Debounce window for threshold temperature writes (ms). */
 const TEMP_DEBOUNCE_MS = 300;
 
+/**
+ * Gap between the two OFF commands the Force Off tile sends. After the first
+ * OFF the unit may start an internal-clean drying cycle that keeps the indoor
+ * fan running; per Hitachi's guidance a second OFF cancels it, but only once
+ * that cycle has begun. This delay (plus cloud round-trip latency) gives the
+ * first OFF time to land and the drying to start before the cancel is sent.
+ */
+const FORCE_OFF_REPEAT_DELAY_MS = 5000;
+
+/** Resolve after `ms` milliseconds. */
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
 /** Percentage shown on the fan slider for each API fan level. */
 const PCT_BY_LEVEL: Record<FanSpeed, number> = {
   AUTO: 0,
@@ -95,6 +108,7 @@ export class AirCloudHomeAccessory {
   private readonly dryService?: Service;
   private readonly autoFanService?: Service;
   private readonly swingVService?: Service;
+  private readonly forceOffService?: Service;
 
   /** Serialized write queue tail. */
   private writeQueue: Promise<void> = Promise.resolve();
@@ -190,10 +204,18 @@ export class AirCloudHomeAccessory {
       "Swing Vertical",
       "swing-v",
     );
+    // Momentary "Force Off" button: a single OFF can leave the fan running for
+    // the internal-clean drying cycle; this tile sends OFF twice to stop it.
+    this.forceOffService = this.setupOptionalSwitch(
+      this.featureEnabled("showForceOff"),
+      "Force Off",
+      "power-off",
+    );
 
     this.bindModeSwitches();
     this.bindAutoFanSwitch();
     this.bindSwingSwitches();
+    this.bindForceOffSwitch();
 
     // Prune services for features this hardware does not support (Fan Only,
     // Dry Cool, Horizontal swing, Humidifier), including ones an older build of
@@ -510,6 +532,41 @@ export class AirCloudHomeAccessory {
           return this.applyControl({ fanSwing: "OFF" });
         }),
       );
+  }
+
+  /**
+   * Momentary "Force Off" switch. Reads as off and springs back after a tap.
+   * A single OFF can leave the indoor fan running for the internal-clean
+   * drying cycle; tapping this sends OFF, waits for that cycle to begin, then
+   * sends OFF again to cancel it (matching pressing Stop twice on the remote).
+   */
+  private bindForceOffSwitch(): void {
+    const { Characteristic: C } = this.platform;
+    this.forceOffService
+      ?.getCharacteristic(C.On)
+      .onGet(() => this.guardGet(() => false))
+      .onSet((value) =>
+        this.guardSet(() => {
+          if (value) {
+            // Run in the background so HomeKit isn't blocked for the inter-OFF
+            // delay; availability was already checked by guardSet. applyControl
+            // logs its own failures, so just swallow to avoid unhandledRejection.
+            void this.forceOff().catch(() => {});
+          }
+          // Momentary: immediately return the button to off.
+          this.push(this.forceOffService, C.On, false);
+        }),
+      );
+  }
+
+  /**
+   * Send OFF, wait for the internal-clean drying cycle to start, then send OFF
+   * again to cancel it. Both commands go through the serialized write queue.
+   */
+  private async forceOff(): Promise<void> {
+    await this.applyControl({ power: "OFF" });
+    await sleep(FORCE_OFF_REPEAT_DELAY_MS);
+    await this.applyControl({ power: "OFF" });
   }
 
   // ===========================================================================
@@ -866,6 +923,8 @@ export class AirCloudHomeAccessory {
       C.On,
       on && this.device.fanSwing === "VERTICAL",
     );
+    // Force Off is a momentary button; it always reads off.
+    this.push(this.forceOffService, C.On, false);
   }
 
   /** Update one characteristic, or mark it No-Response when offline. */
