@@ -4,6 +4,9 @@
 
 /** Round a number to the nearest multiple of `step`. */
 export function roundToStep(value: number, step: number): number {
+  if (step === 0) {
+    return value;
+  }
   return Math.round(value / step) * step;
 }
 

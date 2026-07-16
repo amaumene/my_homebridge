@@ -13,12 +13,18 @@ RUN npm_config_build_from_source=true npm install --omit dev homebridge homebrid
 # production deps) into homebridge's node_modules where homebridge discovers it.
 # No lockfile / no pinning: always pull the latest packages at build time.
 COPY homebridge-aircloudhome /src/homebridge-aircloudhome
+# eslint + typescript-eslint are lint-only tooling and are not needed to compile
+# the plugin (build = rimraf + tsc). They also cap the TypeScript peer below the
+# current latest (TS 7), which breaks "always latest" installs with ERESOLVE.
+# Drop them from the in-image package.json so the build pulls latest typescript.
 RUN cd /src/homebridge-aircloudhome \
     && rm -f package-lock.json \
+    && npm pkg delete devDependencies.eslint \
+        "devDependencies.@typescript-eslint/eslint-plugin" \
+        "devDependencies.@typescript-eslint/parser" \
     && npm install \
     && npm install axios@latest \
-    && npm install --save-dev typescript@latest rimraf@latest eslint@latest \
-        @typescript-eslint/eslint-plugin@latest @typescript-eslint/parser@latest \
+    && npm install --save-dev typescript@latest rimraf@latest \
     && npm run build \
     && npm prune --omit=dev \
     && mkdir -p /build/node_modules/homebridge-aircloudhome \

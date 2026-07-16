@@ -157,6 +157,13 @@ export class AirCloudHomeAccessory {
   ) {
     this.device = accessory.context.device as Device;
 
+    // Seed the room-temperature fallback from restored state so a fresh
+    // accessory whose first poll reports null does not briefly show 0 °C.
+    const seedRoom = this.device.roomTemperature;
+    if (typeof seedRoom === "number" && !Number.isNaN(seedRoom)) {
+      this.lastGoodRoomTemp = seedRoom;
+    }
+
     const { Service: S, Characteristic: C } = this.platform;
 
     // --- Accessory Information ------------------------------------------------
@@ -561,12 +568,16 @@ export class AirCloudHomeAccessory {
 
   /**
    * Send OFF, wait for the internal-clean drying cycle to start, then send OFF
-   * again to cancel it. Both commands go through the serialized write queue.
+   * again to cancel it. Both OFFs and the delay run inside a SINGLE queued task
+   * so the write queue is held across the gap: no user action (e.g. tapping
+   * Heat) can interleave between the two OFFs and undo the force-off.
    */
-  private async forceOff(): Promise<void> {
-    await this.applyControl({ power: "OFF" });
-    await sleep(FORCE_OFF_REPEAT_DELAY_MS);
-    await this.applyControl({ power: "OFF" });
+  private forceOff(): Promise<void> {
+    return this.enqueue(async () => {
+      await this.sendControl({ power: "OFF" });
+      await sleep(FORCE_OFF_REPEAT_DELAY_MS);
+      await this.sendControl({ power: "OFF" });
+    });
   }
 
   // ===========================================================================
@@ -673,7 +684,7 @@ export class AirCloudHomeAccessory {
     if (this.device.fanSpeed === "AUTO") {
       return this.lastManualSpeedPct;
     }
-    return PCT_BY_LEVEL[this.device.fanSpeed] || this.lastManualSpeedPct;
+    return PCT_BY_LEVEL[this.device.fanSpeed] ?? this.lastManualSpeedPct;
   }
 
   private swingModeValue(): CharacteristicValue {
@@ -789,44 +800,58 @@ export class AirCloudHomeAccessory {
   /**
    * Send a full-state control command and refresh all characteristics.
    *
-   * The actual control call is queued so concurrent setter bursts run strictly
-   * sequentially. The merge reads `this.device` at execution time (inside the
-   * queued task) so serialized writes compose instead of clobbering each other.
+   * The control call is queued so concurrent setter bursts run strictly
+   * sequentially. The setpoint resolution and merge both read `this.device` at
+   * execution time (inside the queued task, in {@link sendControl}) so
+   * serialized writes compose instead of clobbering each other.
    */
   private applyControl(changes: ControlCommand): Promise<void> {
+    return this.enqueue(() => this.sendControl(changes));
+  }
+
+  /**
+   * Resolve mode-dependent setpoint injection and send one full-state control
+   * command, then refresh characteristics.
+   *
+   * MUST run inside the write queue (via {@link enqueue}) — it reads and
+   * mutates `this.device`. Callers needing multiple contiguous commands (Force
+   * Off) enqueue a single task that awaits this more than once.
+   */
+  private async sendControl(changes: ControlCommand): Promise<void> {
     // Entering an absolute mode without an explicit setpoint: choose the
-    // temperature to send. Leaving AUTO (which has no absolute setpoint) carries
-    // over the value the AUTO tile was showing — pivot + offset — so Cool/Heat
-    // starts at the temperature the user saw, not an arbitrary default. Any
-    // other transition reuses the remembered absolute setpoint.
-    const resultMode = changes.mode ?? this.device.mode;
-    if (resultMode !== "AUTO" && changes.iduTemperature === undefined) {
+    // temperature to send. Resolved here at execution time so a preceding
+    // queued write's mode/setpoint is reflected rather than a stale snapshot.
+    // Leaving AUTO (which has no absolute setpoint) carries over the value the
+    // AUTO tile was showing — pivot + offset — so Cool/Heat starts at the
+    // temperature the user saw, not an arbitrary default. Any other transition
+    // reuses the remembered absolute setpoint.
+    let resolved = changes;
+    const resultMode = resolved.mode ?? this.device.mode;
+    if (resultMode !== "AUTO" && resolved.iduTemperature === undefined) {
       const setpoint =
         this.device.mode === "AUTO"
           ? clamp(AUTO_PIVOT + this.autoOffset(), 16, 32)
           : this.lastAbsoluteSetpoint;
-      changes = { ...changes, iduTemperature: setpoint };
+      resolved = { ...resolved, iduTemperature: setpoint };
     }
-    return this.enqueue(async () => {
-      try {
-        this.device = await this.platform.client.control(this.device, changes);
-        this.accessory.context.device = this.device;
-      } catch (error) {
-        this.platform.log.warn(
-          `Control failed for ${this.device.name}:`,
-          error instanceof Error ? error.message : String(error),
-        );
-        // Throw SERVICE_COMMUNICATION_FAILURE so HomeKit shows "No Response"
-        // for this request only. Do NOT persist online=false — a transient
-        // error (e.g. HTTP 500) does not mean the device is offline, and the
-        // next poll will restore authoritative online state.
-        throw this.commError();
-      }
-      this.pushAll();
-      // Protect this optimistic state from a lagging poll until the cloud
-      // confirms it (see isPollSuppressed). Only set on success.
-      this.pollSuppressUntil = Date.now() + POLL_SUPPRESS_MS;
-    });
+    try {
+      this.device = await this.platform.client.control(this.device, resolved);
+      this.accessory.context.device = this.device;
+    } catch (error) {
+      this.platform.log.warn(
+        `Control failed for ${this.device.name}:`,
+        error instanceof Error ? error.message : String(error),
+      );
+      // Throw SERVICE_COMMUNICATION_FAILURE so HomeKit shows "No Response"
+      // for this request only. Do NOT persist online=false — a transient
+      // error (e.g. HTTP 500) does not mean the device is offline, and the
+      // next poll will restore authoritative online state.
+      throw this.commError();
+    }
+    this.pushAll();
+    // Protect this optimistic state from a lagging poll until the cloud
+    // confirms it (see isPollSuppressed). Only set on success.
+    this.pollSuppressUntil = Date.now() + POLL_SUPPRESS_MS;
   }
 
   /** Throw a No-Response error when the device is offline. */
@@ -860,10 +885,11 @@ export class AirCloudHomeAccessory {
   private pushAll(): void {
     const C = this.platform.Characteristic;
 
-    // Track the unit's actual last non-OFF swing (including AUTO and
-    // vertical-only units) so the SwingMode toggle restores what this hardware
-    // really uses instead of a hardcoded BOTH.
-    if (this.device.fanSwing !== "OFF") {
+    // Track the last explicit (non-OFF, non-AUTO) swing so the generic
+    // SwingMode toggle restores a concrete louver setting (VERTICAL on this
+    // hardware) rather than AUTO. Storing AUTO here would make the SwingMode
+    // toggle and the dedicated Vertical switch disagree about what "on" means.
+    if (this.device.fanSwing !== "OFF" && this.device.fanSwing !== "AUTO") {
       this.lastEffectiveSwing = this.device.fanSwing;
     }
 

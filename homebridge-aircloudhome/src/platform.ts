@@ -89,7 +89,8 @@ export class AirCloudHomePlatform implements DynamicPlatformPlugin {
     }
 
     const configuredInterval =
-      typeof config.pollInterval === "number"
+      typeof config.pollInterval === "number" &&
+      Number.isFinite(config.pollInterval)
         ? config.pollInterval
         : DEFAULT_POLL_INTERVAL;
     this.pollIntervalSeconds = Math.max(configuredInterval, MIN_POLL_INTERVAL);
@@ -127,8 +128,9 @@ export class AirCloudHomePlatform implements DynamicPlatformPlugin {
    */
   private async discoverDevices(): Promise<void> {
     let devices: Device[];
+    let complete: boolean;
     try {
-      devices = await this.client.getAllDevices();
+      ({ devices, complete } = await this.client.getAllDevices());
     } catch (error) {
       if (error instanceof AirCloudHomeAuthError) {
         this.log.error(
@@ -147,7 +149,7 @@ export class AirCloudHomePlatform implements DynamicPlatformPlugin {
 
     this.authFailureCount = 0;
     this.clearBackoff();
-    this.syncDevices(devices);
+    this.syncDevices(devices, complete);
     this.schedulePolling();
   }
 
@@ -156,7 +158,7 @@ export class AirCloudHomePlatform implements DynamicPlatformPlugin {
    * Registers new devices, updates existing ones, and prunes accessories that
    * are no longer present in the active set.
    */
-  private syncDevices(devices: Device[]): void {
+  private syncDevices(devices: Device[], complete: boolean): void {
     const activeUuids = new Set<string>();
 
     for (const device of devices) {
@@ -194,7 +196,13 @@ export class AirCloudHomePlatform implements DynamicPlatformPlugin {
       }
     }
 
-    // Prune accessories that no longer correspond to a known device.
+    // Prune accessories that no longer correspond to a known device. Only prune
+    // when the fetch was complete: a partial device list (a family group failed
+    // to list) must not unregister accessories that are merely missing from an
+    // incomplete poll, which would drop their room assignments and automations.
+    if (!complete) {
+      return;
+    }
     const stale = this.accessories.filter((acc) => !activeUuids.has(acc.UUID));
     if (stale.length > 0) {
       this.log.info("Removing %d stale accessory(ies)", stale.length);
@@ -262,13 +270,13 @@ export class AirCloudHomePlatform implements DynamicPlatformPlugin {
    */
   private async poll(): Promise<void> {
     try {
-      const devices = await this.client.getAllDevices();
+      const { devices, complete } = await this.client.getAllDevices();
       this.authFailureCount = 0;
       this.clearBackoff();
       // Resume the regular interval if we arrived here via a one-shot backoff
       // timer (scheduleAuthBackoff tears down pollTimer); no-op otherwise.
       this.schedulePolling();
-      this.syncDevices(devices);
+      this.syncDevices(devices, complete);
     } catch (error) {
       if (error instanceof AirCloudHomeAuthError) {
         this.log.warn(

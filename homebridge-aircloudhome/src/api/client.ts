@@ -210,24 +210,32 @@ export class AirCloudHomeClient {
 
   /**
    * Discovery entry point: fetch every device across all family groups.
+   *
+   * `complete` is true only when every family group listed without error. A
+   * partial result (one family timed out / errored) returns `complete: false`
+   * so the caller can avoid pruning HomeKit accessories that are merely missing
+   * from an incomplete fetch (which would drop room assignments/automations).
    */
-  async getAllDevices(): Promise<Device[]> {
+  async getAllDevices(): Promise<{ devices: Device[]; complete: boolean }> {
     const groups = await this.getFamilyGroups();
     const devices: Device[] = [];
+    let complete = true;
     for (const group of groups) {
       try {
         const idus = await this.getIduList(group.familyId);
         devices.push(...idus);
       } catch (error) {
         // Don't let one failing family group blank out every other group's
-        // devices for the whole poll cycle; log and continue.
+        // devices for the whole poll cycle; log and continue, but mark the
+        // result incomplete so stale-pruning is skipped this cycle.
+        complete = false;
         this.log?.warn(
           `airCloud Home: failed to list devices for family ${group.familyId}:`,
           error instanceof Error ? error.message : String(error),
         );
       }
     }
-    return devices;
+    return { devices, complete };
   }
 
   // ---------------------------------------------------------------------------
@@ -513,13 +521,19 @@ export class AirCloudHomeClient {
         );
       }
       if (status !== undefined) {
-        const body =
-          typeof error.response?.data === "string"
-            ? error.response?.data
-            : JSON.stringify(error.response?.data ?? "");
-        this.log?.debug(
-          `airCloud Home: HTTP ${status} from ${context}: ${body}`,
-        );
+        // Never log auth-endpoint response bodies (they can echo request
+        // context/credentials); only surface bodies for non-auth endpoints.
+        const isAuthEndpoint =
+          context === "sign-in" || context === "refresh-token";
+        if (!isAuthEndpoint) {
+          const body =
+            typeof error.response?.data === "string"
+              ? error.response?.data
+              : JSON.stringify(error.response?.data ?? "");
+          this.log?.debug(
+            `airCloud Home: HTTP ${status} from ${context}: ${body}`,
+          );
+        }
         return new AirCloudHomeCommunicationError(
           `Unexpected HTTP ${status} for ${context}`,
         );
